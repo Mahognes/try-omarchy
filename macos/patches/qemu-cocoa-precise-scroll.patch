@@ -1,0 +1,252 @@
+From: Try Omarchy contributors
+Subject: [PATCH] cocoa: preserve precise macOS scrolling through virtio input
+
+Use AppKit's point-precise scrolling deltas for trackpads, retain fractional
+input between events, and carry it to Linux as REL_WHEEL_HI_RES and
+REL_HWHEEL_HI_RES.  Emit accumulated legacy wheel events at 120-unit
+boundaries for compatibility.  Discrete mouse wheels keep their existing
+button path, and the dedicated pinch device remains unchanged.
+
+diff --git a/hw/input/virtio-input-hid.c b/hw/input/virtio-input-hid.c
+index c40b536..7e5b8fe 100644
+--- a/hw/input/virtio-input-hid.c
++++ b/hw/input/virtio-input-hid.c
+@@ -39,6 +39,8 @@ static const unsigned short keymap_button[INPUT_BUTTON__MAX] = {
+ static const unsigned short axismap_rel[INPUT_AXIS__MAX] = {
+     [INPUT_AXIS_X]                   = REL_X,
+     [INPUT_AXIS_Y]                   = REL_Y,
++    [INPUT_AXIS_WHEEL]               = REL_WHEEL_HI_RES,
++    [INPUT_AXIS_HWHEEL]              = REL_HWHEEL_HI_RES,
+ };
+ 
+ static const unsigned short axismap_abs[INPUT_AXIS__MAX] = {
+@@ -84,6 +86,7 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+                                       QemuInputEvent *evt)
+ {
+     VirtIOInput *vinput = VIRTIO_INPUT(dev);
++    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
+     virtio_input_event event;
+ 
+     switch (evt->type) {
+@@ -116,6 +119,32 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+         }
+         break;
+     case INPUT_EVENT_KIND_REL:
++        if (evt->rel.axis == INPUT_AXIS_WHEEL ||
++            evt->rel.axis == INPUT_AXIS_HWHEEL) {
++            int64_t *remainder = evt->rel.axis == INPUT_AXIS_WHEEL ?
++                                 &vhid->wheel_remainder :
++                                 &vhid->hwheel_remainder;
++            int legacy_code = evt->rel.axis == INPUT_AXIS_WHEEL ?
++                              REL_WHEEL : REL_HWHEEL;
++            int64_t total = *remainder + evt->rel.value;
++            int legacy_steps = total / 120;
++
++            event.type = cpu_to_le16(EV_REL);
++            event.code = cpu_to_le16(axismap_rel[evt->rel.axis]);
++            event.value = cpu_to_le32(evt->rel.value);
++            virtio_input_send(vinput, &event);
++
++            *remainder = total % 120;
++            if (legacy_steps) {
++                event.code = cpu_to_le16(legacy_code);
++                event.value = cpu_to_le32(legacy_steps);
++                virtio_input_send(vinput, &event);
++            }
++            break;
++        }
++        if (evt->rel.axis != INPUT_AXIS_X && evt->rel.axis != INPUT_AXIS_Y) {
++            break;
++        }
+         event.type  = cpu_to_le16(EV_REL);
+         event.code  = cpu_to_le16(axismap_rel[evt->rel.axis]);
+         event.value = cpu_to_le32(evt->rel.value);
+@@ -375,7 +404,8 @@ static const TypeInfo virtio_mouse_info = {
+ 
+ static const QemuInputHandler virtio_tablet_handler = {
+     .name  = VIRTIO_ID_NAME_TABLET,
+-    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL |
++             INPUT_EVENT_MASK_ABS,
+     .event = virtio_input_handle_event,
+     .sync  = virtio_input_handle_sync,
+ };
+@@ -406,8 +436,10 @@ static struct virtio_input_config virtio_tablet_config[] = {
+         .subsel    = EV_REL,
+         .size      = 2,
+         .u.bitmap  = {
+-            0,
+-            (1 << (REL_WHEEL - 8))
++            (1 << REL_HWHEEL),
++            (1 << (REL_WHEEL - 8)) |
++            (1 << (REL_WHEEL_HI_RES - 8)) |
++            (1 << (REL_HWHEEL_HI_RES - 8))
+         },
+     },{
+         .select    = VIRTIO_INPUT_CFG_ABS_INFO,
+diff --git a/include/hw/virtio/virtio-input.h b/include/hw/virtio/virtio-input.h
+index a382d9f..05e7d14 100644
+--- a/include/hw/virtio/virtio-input.h
++++ b/include/hw/virtio/virtio-input.h
+@@ -90,6 +90,8 @@ struct VirtIOInputHID {
+     const QemuInputHandler            *handler;
+     QemuInputHandlerState             *hs;
+     int                               ledstate;
++    int64_t                           wheel_remainder;
++    int64_t                           hwheel_remainder;
+ };
+ 
+ struct VirtIOInputHost {
+diff --git a/include/ui/cocoa-scroll.h b/include/ui/cocoa-scroll.h
+new file mode 100644
+index 0000000..b9b440f
+--- /dev/null
++++ b/include/ui/cocoa-scroll.h
+@@ -0,0 +1,67 @@
++/*
++ * Cocoa precise-scroll conversion, independent of AppKit for testing.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_COCOA_SCROLL_H
++#define QEMU_COCOA_SCROLL_H
++
++#include <limits.h>
++#include <math.h>
++
++typedef struct CocoaScroll {
++    double residual_x;
++    double residual_y;
++} CocoaScroll;
++
++typedef struct CocoaScrollFrame {
++    int x;
++    int y;
++} CocoaScrollFrame;
++
++/*
++ * AppKit reports precise deltas in points.  Keep one Linux high-resolution
++ * wheel unit per point: this avoids inventing acceleration on top of macOS's
++ * device acceleration, while retaining sub-point deltas between events.
++ */
++static inline int cocoa_scroll_axis(double delta, double *residual)
++{
++    double value;
++    int whole;
++
++    if (!isfinite(delta)) {
++        *residual = 0.0;
++        return 0;
++    }
++
++    value = delta + *residual;
++    if (value >= INT_MAX) {
++        *residual = 0.0;
++        return INT_MAX;
++    }
++    if (value <= INT_MIN) {
++        *residual = 0.0;
++        return INT_MIN;
++    }
++
++    whole = (int)trunc(value);
++    *residual = value - whole;
++    return whole;
++}
++
++static inline CocoaScrollFrame cocoa_scroll_update(CocoaScroll *scroll,
++                                                    double x, double y)
++{
++    CocoaScrollFrame frame = {
++        .x = cocoa_scroll_axis(x, &scroll->residual_x),
++        .y = cocoa_scroll_axis(y, &scroll->residual_y),
++    };
++    return frame;
++}
++
++static inline void cocoa_scroll_cancel(CocoaScroll *scroll)
++{
++    scroll->residual_x = 0.0;
++    scroll->residual_y = 0.0;
++}
++
++#endif
+diff --git a/qapi/ui.json b/qapi/ui.json
+index e76aa4c..4f0ed20 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1068,12 +1068,19 @@
+ ##
+ # @InputAxis:
+ #
+-# Position axis of a pointer input device (mouse, tablet).
++# Position or high-resolution wheel axis of a pointer input device.
++#
++# @wheel: vertical high-resolution wheel movement in Linux v120 units
++#     (Try Omarchy downstream)
++#
++# @hwheel: horizontal high-resolution wheel movement in Linux v120
++#     units
++#     (Try Omarchy downstream)
+ #
+ # Since: 2.0
+ ##
+ { 'enum'  : 'InputAxis',
+-  'data'  : [ 'x', 'y' ] }
++  'data'  : [ 'x', 'y', 'wheel', 'hwheel' ] }
+ 
+ ##
+ # @InputMultiTouchType:
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index dbd90e6..59a77d4 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -38,6 +38,7 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/cocoa-pinch.h"
++#include "ui/cocoa-scroll.h"
+ #include "ui/kbd-state.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -346,6 +347,7 @@ @interface QemuCocoaView : NSView
+     int mouseY;
+     bool mouseOn;
+     CocoaPinch pinch;
++    CocoaScroll scroll;
+ }
+ - (void) grabMouse;
+ - (void) ungrabMouse;
+@@ -1183,7 +1185,32 @@ - (bool) handleEventLocked:(NSEvent *)event
+              * This is in-line with standard Mac OS X UI behaviour.
+              */
+ 
+-            /* Determine if this is a scroll up or scroll down event */
++            if ([event hasPreciseScrollingDeltas]) {
++                CocoaScrollFrame frame;
++
++                if (([event phase] & NSEventPhaseCancelled) ||
++                    ([event momentumPhase] & NSEventPhaseCancelled)) {
++                    cocoa_scroll_cancel(&scroll);
++                    return true;
++                }
++
++                frame = cocoa_scroll_update(&scroll,
++                                            [event scrollingDeltaX],
++                                            [event scrollingDeltaY]);
++                /* Cocoa's positive X means left; Linux REL_HWHEEL is right. */
++                if (frame.x) {
++                    qemu_input_queue_rel(dcl.con, INPUT_AXIS_HWHEEL, -frame.x);
++                }
++                if (frame.y) {
++                    qemu_input_queue_rel(dcl.con, INPUT_AXIS_WHEEL, frame.y);
++                }
++                if (frame.x || frame.y) {
++                    qemu_input_event_sync();
++                }
++                return true;
++            }
++
++            /* Preserve discrete mouse-wheel behavior exactly. */
+             if ([event deltaY] != 0) {
+                 button = ([event deltaY] > 0) ?
+                     INPUT_BUTTON_WHEEL_UP : INPUT_BUTTON_WHEEL_DOWN;
