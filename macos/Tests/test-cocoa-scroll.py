@@ -23,6 +23,34 @@ def added_file(path):
 
 
 class CocoaScrollTests(unittest.TestCase):
+    def test_discrete_wheel_after_precise_scroll(self):
+        # Compile the actual patched BTN/REL dispatch, with only QEMU's device
+        # and transport interfaces stubbed. Keep the cases in one patch hunk
+        # so missing context cannot silently change the code under test.
+        section = PATCH.read_text().split(
+            "diff --git a/hw/input/virtio-input-hid.c "
+            "b/hw/input/virtio-input-hid.c\n", 1
+        )[1].split("\ndiff --git ", 1)[0]
+        cases = None
+        for hunk in re.split(r"^@@.*@@.*$", section, flags=re.M)[1:]:
+            source = "\n".join(line[1:] for line in hunk.splitlines()
+                               if line.startswith((" ", "+")))
+            if ("case INPUT_EVENT_KIND_BTN:" in source and
+                    "case INPUT_EVENT_KIND_ABS:" in source):
+                cases = source.split("case INPUT_EVENT_KIND_BTN:", 1)[1]
+                cases = "case INPUT_EVENT_KIND_BTN:" + cases.split(
+                    "case INPUT_EVENT_KIND_ABS:", 1)[0]
+                break
+        self.assertIsNotNone(cases, "wheel dispatch must be a complete patch hunk")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            harness = (ROOT / "macos/Tests/virtio-scroll-harness.c").read_text()
+            (work / "test.c").write_text(harness.replace("/* WHEEL_DISPATCH */", cases))
+            compiler = shlex.split(os.environ.get("CC", "cc"))
+            subprocess.run(compiler + ["-std=c11", "-Wall", "-Wextra", "-Werror",
+                           str(work / "test.c"), "-o", str(work / "test")], check=True)
+            subprocess.run([str(work / "test")], check=True)
+
     def test_fractional_deltas_are_retained(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
